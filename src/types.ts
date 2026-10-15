@@ -81,8 +81,10 @@ export type UsageRow = {
   packs: number;
 };
 
-export type BackgroundMode = 'keep' | 'remove-white';
+export type BackgroundMode = 'keep' | 'smart-edge' | 'remove-white';
 export type GenerationStyle = 'cartoon' | 'realistic';
+
+export type CropFocus = 'full' | 'head';
 
 export type ConvertOptions = {
   width: number;
@@ -93,6 +95,9 @@ export type ConvertOptions = {
   tolerance: number;
   speckleReduction: number;
   generationStyle: GenerationStyle;
+  cropFocus?: CropFocus;
+  edgeBoost?: boolean;
+  photoSimplifier?: boolean;
 };
 
 export type ConvertResult = {

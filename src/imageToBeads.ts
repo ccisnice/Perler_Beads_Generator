@@ -40,24 +40,59 @@ const styleProfiles: Record<GenerationStyle, StyleProfile> = {
 
 export async function imageFileToBeads(file: File, options: ConvertOptions): Promise<ConvertResult> {
   const image = await loadImage(file);
+  let srcX = 0;
+  let srcY = 0;
+  let srcW = Math.max(1, image.naturalWidth);
+  let srcH = Math.max(1, image.naturalHeight);
+
+  if (options.cropFocus === 'head') {
+    srcX = Math.round(srcW * 0.14);
+    srcY = Math.round(srcH * 0.04);
+    srcW = Math.round(srcW * 0.72);
+    srcH = Math.round(srcH * 0.62);
+  }
+
   const width = Math.max(1, Math.round(options.width));
-  const height = Math.max(1, Math.round((image.naturalHeight / image.naturalWidth) * width));
-  const sourceWidth = Math.max(1, image.naturalWidth);
-  const sourceHeight = Math.max(1, image.naturalHeight);
+  const height = Math.max(1, Math.round((srcH / srcW) * width));
+
+  // Determine working intermediate dimensions:
+  // If photoSimplifier is enabled (or true by default), scale to ~4x the target grid (e.g. 208x208 for 52x52).
+  // This allows the Kuwahara filter to operate at the exact bead scale, removing photographic noise & pores
+  // while preserving sharp 1-bead edges like glasses frames and pupils.
+  const useSimplifier = options.photoSimplifier !== false;
+  let workW = srcW;
+  let workH = srcH;
+  if (useSimplifier && (srcW > width * 4 || srcH > height * 4)) {
+    workW = Math.max(1, Math.round(width * 4));
+    workH = Math.max(1, Math.round(height * 4));
+  }
+
   const canvas = document.createElement('canvas');
-  canvas.width = sourceWidth;
-  canvas.height = sourceHeight;
+  canvas.width = workW;
+  canvas.height = workH;
   const context = canvas.getContext('2d', { willReadFrequently: true });
   if (!context) throw new Error('Canvas is not available.');
   context.imageSmoothingEnabled = true;
-  context.drawImage(image, 0, 0, sourceWidth, sourceHeight);
-  const data = context.getImageData(0, 0, sourceWidth, sourceHeight).data;
+  context.drawImage(image, srcX, srcY, srcW, srcH, 0, 0, workW, workH);
+  const data = context.getImageData(0, 0, workW, workH).data;
+
+  if (useSimplifier) {
+    applySkinClarity(data);
+    applyKuwaharaFilter(data, workW, workH, 2);
+    applyPosterization(data, 10);
+  }
+
+  if (options.edgeBoost) {
+    enhanceContourLines(data);
+  }
+
   const activePalette = options.palette ?? palette;
   const profile = styleProfiles[options.generationStyle ?? 'cartoon'];
   const requestedSpeckleStrength = options.speckleReduction ?? 0;
   const speckleStrength = requestedSpeckleStrength > 0 ? clampStrength(requestedSpeckleStrength + profile.postStrengthBias) : 0;
-  const backgroundColor = estimateBackgroundColor(data, sourceWidth, sourceHeight);
-  const sampledCells = sampleGridCells(data, sourceWidth, sourceHeight, width, height, options, backgroundColor, profile, speckleStrength);
+  const backgroundColor = estimateBackgroundColor(data, workW, workH);
+  const backgroundMask = computeBackgroundMask(data, workW, workH, options, backgroundColor);
+  const sampledCells = sampleGridCells(data, workW, workH, width, height, options, backgroundMask, profile, speckleStrength);
   const ranked = rankPaletteColors(sampledCells, options, activePalette, profile);
   const candidates = selectCandidateColors(ranked, Math.max(2, options.maxColors), activePalette, speckleStrength, profile);
   const cells = sampledCells.map((cell) => chooseCellColor(cell, candidates, profile));
@@ -92,8 +127,8 @@ function sampleGridCells(
   sourceHeight: number,
   width: number,
   height: number,
-  options: ConvertOptions,
-  detectedBackgroundColor: [number, number, number],
+  _options: ConvertOptions,
+  backgroundMask: Uint8Array,
   profile: StyleProfile,
   speckleStrength: number,
 ): SampledCell[] {
@@ -117,13 +152,13 @@ function sampleGridCells(
             sourceHeight - 1,
             Math.max(0, Math.floor(((y + (sy + 0.5) / profile.sampleSide) / height) * sourceHeight)),
           );
-          const index = (sourceY * sourceWidth + sourceX) * 4;
-          const alpha = data[index + 3];
-          const rgb: [number, number, number] = [data[index], data[index + 1], data[index + 2]];
-          if (isBackgroundSample(alpha, rgb, options, detectedBackgroundColor)) {
+          const pixelIndex = sourceY * sourceWidth + sourceX;
+          if (backgroundMask[pixelIndex] === 1) {
             backgroundCount += 1;
             continue;
           }
+          const index = pixelIndex * 4;
+          const rgb: [number, number, number] = [data[index], data[index + 1], data[index + 2]];
           const simplified = simplifySourceRgb(rgb, speckleStrength);
           samples.push(simplified);
           r += simplified[0];
@@ -512,20 +547,136 @@ function majorityColor(colors: Array<string | null>): { colorId: string | null; 
     .sort((a, b) => b.count - a.count)[0] ?? { colorId: null, count: 0 };
 }
 
-function isBackgroundSample(
-  alpha: number,
-  rgb: [number, number, number],
+function computeBackgroundMask(
+  data: Uint8ClampedArray,
+  sourceWidth: number,
+  sourceHeight: number,
   options: ConvertOptions,
   detectedBackgroundColor: [number, number, number],
-): boolean {
-  if (alpha < 24) return true;
-  if (options.backgroundMode === 'keep') return false;
-  const distance = Math.sqrt(
-    (rgb[0] - detectedBackgroundColor[0]) ** 2 +
-      (rgb[1] - detectedBackgroundColor[1]) ** 2 +
-      (rgb[2] - detectedBackgroundColor[2]) ** 2,
-  );
-  return distance <= options.tolerance;
+): Uint8Array {
+  const totalPixels = sourceWidth * sourceHeight;
+  const mask = new Uint8Array(totalPixels);
+  if (options.backgroundMode === 'keep') {
+    for (let i = 0; i < totalPixels; i += 1) {
+      if (data[i * 4 + 3] < 24) mask[i] = 1;
+    }
+    return mask;
+  }
+
+  const bgR = detectedBackgroundColor[0];
+  const bgG = detectedBackgroundColor[1];
+  const bgB = detectedBackgroundColor[2];
+  const tolSq = options.tolerance * options.tolerance;
+
+  const isColorMatch = (i: number): boolean => {
+    const idx = i * 4;
+    if (data[idx + 3] < 24) return true;
+    const dr = data[idx] - bgR;
+    const dg = data[idx + 1] - bgG;
+    const db = data[idx + 2] - bgB;
+    return dr * dr + dg * dg + db * db <= tolSq;
+  };
+
+  if (options.backgroundMode === 'remove-white') {
+    const whiteTolSq = 40 * 40;
+    for (let i = 0; i < totalPixels; i += 1) {
+      const idx = i * 4;
+      if (data[idx + 3] < 24) {
+        mask[i] = 1;
+        continue;
+      }
+      const dr = data[idx] - bgR;
+      const dg = data[idx + 1] - bgG;
+      const db = data[idx + 2] - bgB;
+      if (dr * dr + dg * dg + db * db <= tolSq) {
+        mask[i] = 1;
+        continue;
+      }
+      const wdr = data[idx] - 255;
+      const wdg = data[idx + 1] - 255;
+      const wdb = data[idx + 2] - 255;
+      if (wdr * wdr + wdg * wdg + wdb * wdb <= whiteTolSq) {
+        mask[i] = 1;
+      }
+    }
+    return mask;
+  }
+
+  // options.backgroundMode === 'smart-edge'
+  // Connected Component / Flood-Fill starting exclusively from image borders
+  const queue = new Int32Array(totalPixels);
+  let head = 0;
+  let tail = 0;
+
+  for (let i = 0; i < totalPixels; i += 1) {
+    if (data[i * 4 + 3] < 24) {
+      mask[i] = 1;
+      queue[tail++] = i;
+    }
+  }
+
+  for (let x = 0; x < sourceWidth; x += 1) {
+    const top = x;
+    if (!mask[top] && isColorMatch(top)) {
+      mask[top] = 1;
+      queue[tail++] = top;
+    }
+    const bottom = (sourceHeight - 1) * sourceWidth + x;
+    if (!mask[bottom] && isColorMatch(bottom)) {
+      mask[bottom] = 1;
+      queue[tail++] = bottom;
+    }
+  }
+
+  for (let y = 0; y < sourceHeight; y += 1) {
+    const left = y * sourceWidth;
+    if (!mask[left] && isColorMatch(left)) {
+      mask[left] = 1;
+      queue[tail++] = left;
+    }
+    const right = y * sourceWidth + (sourceWidth - 1);
+    if (!mask[right] && isColorMatch(right)) {
+      mask[right] = 1;
+      queue[tail++] = right;
+    }
+  }
+
+  while (head < tail) {
+    const curr = queue[head++];
+    const cx = curr % sourceWidth;
+    const cy = Math.floor(curr / sourceWidth);
+
+    if (cx > 0) {
+      const left = curr - 1;
+      if (!mask[left] && isColorMatch(left)) {
+        mask[left] = 1;
+        queue[tail++] = left;
+      }
+    }
+    if (cx < sourceWidth - 1) {
+      const right = curr + 1;
+      if (!mask[right] && isColorMatch(right)) {
+        mask[right] = 1;
+        queue[tail++] = right;
+      }
+    }
+    if (cy > 0) {
+      const up = curr - sourceWidth;
+      if (!mask[up] && isColorMatch(up)) {
+        mask[up] = 1;
+        queue[tail++] = up;
+      }
+    }
+    if (cy < sourceHeight - 1) {
+      const down = curr + sourceWidth;
+      if (!mask[down] && isColorMatch(down)) {
+        mask[down] = 1;
+        queue[tail++] = down;
+      }
+    }
+  }
+
+  return mask;
 }
 
 function luminance(rgb: [number, number, number]): number {
@@ -608,3 +759,127 @@ function pushOpaqueSample(
   if (data[index + 3] < 24) return;
   samples.push([data[index], data[index + 1], data[index + 2]]);
 }
+
+function enhanceContourLines(data: Uint8ClampedArray): void {
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 24) continue;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    // Dark lines (glasses, eyelashes, outlines)
+    if (lum < 95) {
+      data[i] = Math.max(0, Math.round(r * 0.45));
+      data[i + 1] = Math.max(0, Math.round(g * 0.45));
+      data[i + 2] = Math.max(0, Math.round(b * 0.45));
+    } else if (lum < 140) {
+      // Deepen antialiased boundary pixels
+      data[i] = Math.max(0, Math.round(r * 0.72));
+      data[i + 1] = Math.max(0, Math.round(g * 0.72));
+      data[i + 2] = Math.max(0, Math.round(b * 0.72));
+    }
+  }
+}
+
+function applySkinClarity(data: Uint8ClampedArray): void {
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 24) continue;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    // Don't lift dark lines / features (glasses, pupils, eyebrows)
+    if (lum < 75) continue;
+    // Gentle midtone brightening to prevent dark murky skin
+    const factor = 1.06;
+    data[i] = Math.min(255, Math.round(r * factor));
+    data[i + 1] = Math.min(255, Math.round(g * factor));
+    data[i + 2] = Math.min(255, Math.round(b * (factor * 0.96)));
+  }
+}
+
+function applyKuwaharaFilter(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  radius: number = 2,
+): void {
+  const copy = new Uint8ClampedArray(data);
+  const getPixel = (px: number, py: number): [number, number, number] => {
+    const cx = Math.max(0, Math.min(width - 1, px));
+    const cy = Math.max(0, Math.min(height - 1, py));
+    const idx = (cy * width + cx) * 4;
+    return [copy[idx], copy[idx + 1], copy[idx + 2]];
+  };
+
+  const quadrants = [
+    { x0: -radius, x1: 0, y0: -radius, y1: 0 },
+    { x0: 0, x1: radius, y0: -radius, y1: 0 },
+    { x0: -radius, x1: 0, y0: 0, y1: radius },
+    { x0: 0, x1: radius, y0: 0, y1: radius },
+  ];
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const idx = (y * width + x) * 4;
+      if (copy[idx + 3] < 24) continue;
+
+      let minVariance = Infinity;
+      let bestMean: [number, number, number] = [copy[idx], copy[idx + 1], copy[idx + 2]];
+
+      for (let q = 0; q < 4; q += 1) {
+        const quadrant = quadrants[q];
+        let count = 0;
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let sumSqR = 0;
+        let sumSqG = 0;
+        let sumSqB = 0;
+
+        for (let dy = quadrant.y0; dy <= quadrant.y1; dy += 1) {
+          for (let dx = quadrant.x0; dx <= quadrant.x1; dx += 1) {
+            const [pr, pg, pb] = getPixel(x + dx, y + dy);
+            sumR += pr;
+            sumG += pg;
+            sumB += pb;
+            sumSqR += pr * pr;
+            sumSqG += pg * pg;
+            sumSqB += pb * pb;
+            count += 1;
+          }
+        }
+
+        if (count === 0) continue;
+        const meanR = sumR / count;
+        const meanG = sumG / count;
+        const meanB = sumB / count;
+
+        const varR = sumSqR / count - meanR * meanR;
+        const varG = sumSqG / count - meanG * meanG;
+        const varB = sumSqB / count - meanB * meanB;
+        const totalVariance = varR + varG + varB;
+
+        if (totalVariance < minVariance) {
+          minVariance = totalVariance;
+          bestMean = [Math.round(meanR), Math.round(meanG), Math.round(meanB)];
+        }
+      }
+
+      data[idx] = bestMean[0];
+      data[idx + 1] = bestMean[1];
+      data[idx + 2] = bestMean[2];
+    }
+  }
+}
+
+function applyPosterization(data: Uint8ClampedArray, levels: number = 10): void {
+  const step = 255 / (levels - 1);
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 24) continue;
+    data[i] = Math.min(255, Math.max(0, Math.round(Math.round(data[i] / step) * step)));
+    data[i + 1] = Math.min(255, Math.max(0, Math.round(Math.round(data[i + 1] / step) * step)));
+    data[i + 2] = Math.min(255, Math.max(0, Math.round(Math.round(data[i + 2] / step) * step)));
+  }
+}
+

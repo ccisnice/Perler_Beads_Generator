@@ -1,4 +1,4 @@
-﻿import WorkspaceCanvas from './WorkspaceCanvas';
+import WorkspaceCanvas from './WorkspaceCanvas';
 import ThreePreview from './ThreePreview';
 import { downloadPrintPdf, downloadPrintPng, downloadProjectJson, downloadUsageWorkbook } from './exporters';
 import type { PrintExportOptions } from './exporters';
@@ -6,7 +6,7 @@ import { imageFileToBeads } from './imageToBeads';
 import { basicPalette, colorDistance, completePalette, getColor, nearestPaletteColor } from './palette';
 import { composeVisibleCells, createLayer, createProject, loadDraft, normalizeProject, saveDraft, withCells, withLayers } from './project';
 import { findIsolatedBeads, summarizeUsage } from './usage';
-import type { ArrowKind, BackgroundMode, BeadProject, ClipboardPattern, CopyMode, GenerationStyle, MirrorDirection, MoveMode, RemoveMode, RightClickAction, ShapeFillMode, ShapeKind, TextDirection, ToolId } from './types';
+import type { ArrowKind, BackgroundMode, BeadProject, ClipboardPattern, CopyMode, CropFocus, GenerationStyle, MirrorDirection, MoveMode, RemoveMode, RightClickAction, ShapeFillMode, ShapeKind, TextDirection, ToolId } from './types';
 
 const { useEffect, useMemo, useRef, useState } = React;
 
@@ -78,9 +78,27 @@ const ui: Record<Language, any> = {
         generationStyleRealistic: '写实',
         tolerance: '容差',
         toleranceHint: '容差越大，越多接近背景色的像素会被去除；容差越小，边缘保留越多。',
-        background: '背景',
-        keepBackground: '保留背景',
-        removeWhite: '去除背景',
+        background: '背景处理',
+        keepBackground: '🖼️ 保留整幅原图（适合相框/风景）',
+        smartEdge: '✂️ 智能边缘去底（保护主体防空洞）',
+        removeWhite: '⚪ 清除纯白/极浅底',
+        quickBoardsTitle: '底板快捷选择',
+        quickBoard1: '1块板 (52×52)',
+        quickBoard2: '双板 (104×52)',
+        quickBoard4: '4块大板 (104×104 写实推荐)',
+        fitBoard: '自适应底板宽度',
+        hideGrid: '隐藏网格线',
+        showGrid: '显示网格线',
+        tipRealPhoto: '💡 贴士：实拍生活照、相框类推荐选【4块大板】和【保留整幅原图】；人像、玩偶推荐选【智能边缘去底】。',
+        cropFocusTitle: 'AI 画面构图',
+        cropFocusFull: '🖼️ 完整画面',
+        cropFocusHead: '👤 聚焦头部特写 (小板清晰神器)',
+        edgeBoostTitle: '边缘增强',
+        edgeBoostLabel: '✏️ 强化眼镜与五官描边 (防断线)',
+        photoSimplifierLabel: '✨ 真人照片智能净化 (防麻子脸/平滑)',
+        photoSimplifierTip: '基于 Kuwahara 边缘保留平滑与波普色阶压缩，消除手机实拍中细碎的皮肤杂色与噪点，在 1 板上保持通透利落。',
+        oneClickMagic1Board: '✨ 一键 1 板超清立牌 (智能特写+去底)',
+        oneClickMagicNotice: '已应用 1 板智能特写与轮廓强化，小尺寸细节提升 3 倍！',
         preparingPattern: '正在生成图案',
         autoGenerateHint: '调整参数后会自动更新画布。',
         palette: '调色盘',
@@ -292,8 +310,26 @@ const ui: Record<Language, any> = {
         tolerance: 'Tolerance',
         toleranceHint: 'Higher tolerance removes more pixels close to the background color; lower tolerance keeps more edge detail.',
         background: 'Background',
-        keepBackground: 'Keep background',
-        removeWhite: 'Remove background',
+        keepBackground: '🖼️ Keep full picture (Photos/Frames)',
+        smartEdge: '✂️ Smart edge cutout (Protects subject)',
+        removeWhite: '⚪ Remove white/light pixels',
+        quickBoardsTitle: 'Pegboard presets',
+        quickBoard1: '1 Board (52×52)',
+        quickBoard2: '2 Boards (104×52)',
+        quickBoard4: '4 Boards (104×104 High-res)',
+        fitBoard: 'Fit to current board',
+        hideGrid: 'Hide grid lines',
+        showGrid: 'Show grid lines',
+        tipRealPhoto: '💡 Tip: For real photos & frames, choose [4 Boards] + [Keep full picture]. For avatars & pets, use [Smart edge cutout].',
+        cropFocusTitle: 'AI Framing',
+        cropFocusFull: '🖼️ Full Frame',
+        cropFocusHead: '👤 Head Close-up (Crisp on 1 Board)',
+        edgeBoostTitle: 'Edge Boost',
+        edgeBoostLabel: '✏️ Enhance Contours (Glasses & Eyes)',
+        photoSimplifierLabel: '✨ Photo Clean Skin (Anti-Noise / Cel-shaded)',
+        photoSimplifierTip: 'Kuwahara edge-preserving filter eliminates photographic noise and blotchy skin, keeping 1-board portraits clean.',
+        oneClickMagic1Board: '✨ 1-Board Magic Portrait (Auto Close-up)',
+        oneClickMagicNotice: '1-board AI close-up and edge boost applied! Details boosted 3x.',
         preparingPattern: 'Generating pattern',
         autoGenerateHint: 'Changes update the canvas automatically.',
         palette: 'Palette',
@@ -470,6 +506,85 @@ const sizePresets = [
   { label: '156 * 156', width: 156, height: 156 },
 ];
 
+function getPresetForBoardCount(boardCount: number, ratio: number = 1): {
+  label: string;
+  targetWidth: number;
+  canvasW: number;
+  canvasH: number;
+  desc: string;
+  estBeads: string;
+} {
+  const isVertical = ratio < 0.88;
+  const isHorizontal = ratio > 1.15;
+
+  if (boardCount === 1) {
+    const targetW = isVertical ? Math.max(24, Math.round(52 * ratio)) : 52;
+    return {
+      label: '1块板',
+      targetWidth: targetW,
+      canvasW: 52,
+      canvasH: 52,
+      desc: '单板小画',
+      estBeads: isVertical ? '38×52 · 约2000豆' : '52×52 · 约2700豆',
+    };
+  }
+
+  if (boardCount === 2) {
+    if (isVertical) {
+      return {
+        label: '双板',
+        targetWidth: 52,
+        canvasW: 52,
+        canvasH: 104,
+        desc: '竖版立牌',
+        estBeads: '52×70 · 约3600豆',
+      };
+    } else {
+      return {
+        label: '双板',
+        targetWidth: 104,
+        canvasW: 104,
+        canvasH: 52,
+        desc: '横版摆件',
+        estBeads: '104×52 · 约3600~5400豆',
+      };
+    }
+  }
+
+  if (boardCount === 4) {
+    const targetW = isVertical ? Math.max(56, Math.min(104, Math.round(104 * ratio))) : 104;
+    return {
+      label: '4块大板',
+      targetWidth: targetW,
+      canvasW: 104,
+      canvasH: 104,
+      desc: '精细大画',
+      estBeads: isVertical ? '78×104 · 约8000豆 (细节翻倍)' : '104×104 · 约1万豆',
+    };
+  }
+
+  // boardCount === 6
+  if (isVertical) {
+    return {
+      label: '6块大板',
+      targetWidth: 104,
+      canvasW: 104,
+      canvasH: 156,
+      desc: '高清海报',
+      estBeads: '104×140 · 约1.4万豆 (写本质感)',
+    };
+  } else {
+    return {
+      label: '6块大板',
+      targetWidth: 156,
+      canvasW: 156,
+      canvasH: 104,
+      desc: '高清海报',
+      estBeads: '156×104 · 约1.4万豆 (写本质感)',
+    };
+  }
+}
+
 const defaultImportSettings = {
   width: 52,
   maxColors: 24,
@@ -552,6 +667,8 @@ export default function App() {
   const [copySelectionIndices, setCopySelectionIndices] = useState<number[]>([]);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingImageUrl, setPendingImageUrl] = useState<string | null>(null);
+  const [imageRatio, setImageRatio] = useState<number>(1);
+  const [selectedBoardCount, setSelectedBoardCount] = useState<number | null>(null);
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [referenceImageUrl, setReferenceImageUrl] = useState<string | null>(null);
   const [referenceVisible, setReferenceVisible] = useState(false);
@@ -567,6 +684,9 @@ export default function App() {
   const [generationStyle, setGenerationStyle] = useState<GenerationStyle>(defaultImportSettings.generationStyle);
   const [backgroundMode, setBackgroundMode] = useState<BackgroundMode>(defaultImportSettings.backgroundMode);
   const [tolerance, setTolerance] = useState(defaultImportSettings.tolerance);
+  const [cropFocus, setCropFocus] = useState<CropFocus>('full');
+  const [edgeBoost, setEdgeBoost] = useState(true);
+  const [photoSimplifier, setPhotoSimplifier] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [notice, setNotice] = useState(text.workspaceReady);
   const [floatingHelp, setFloatingHelp] = useState<FloatingHelp | null>(null);
@@ -772,7 +892,7 @@ export default function App() {
       void generateFromImage({ recordHistory: shouldCommit, automatic: true });
     }, 420);
     return () => window.clearTimeout(timer);
-  }, [pendingFile, convertWidth, maxColors, generationStyle, backgroundMode, tolerance, paletteMode]);
+  }, [pendingFile, convertWidth, maxColors, generationStyle, backgroundMode, tolerance, paletteMode, cropFocus, edgeBoost, photoSimplifier]);
 
   function commitHistory() {
     setPast((items) => [...items.slice(-39), project]);
@@ -1011,11 +1131,82 @@ export default function App() {
     setNotice(language === 'zh' ? `画布已调整为 ${width} * ${height}。` : `Canvas resized to ${width} x ${height}.`);
   }
 
+  function selectBoardByCount(count: 1 | 2 | 4 | 6) {
+    setSelectedBoardCount(count);
+    const preset = getPresetForBoardCount(count, imageRatio);
+    setConvertWidth(preset.targetWidth);
+    setCanvasWidth(preset.canvasW);
+    setCanvasHeight(preset.canvasH);
+    commitHistory();
+    const nextLayers = layers.map((layer) => ({
+      ...layer,
+      cells: placeCellsCentered(layer.cells, project.width, project.height, preset.canvasW, preset.canvasH),
+    }));
+    updateProject({
+      ...project,
+      width: preset.canvasW,
+      height: preset.canvasH,
+      layers: nextLayers,
+      cells: composeVisibleCells(nextLayers, preset.canvasW, preset.canvasH),
+    });
+    if (pendingFile) {
+      autoGenerateShouldCommitRef.current = true;
+    }
+    setNotice(
+      language === 'zh'
+        ? `已切换为 ${preset.label}（${preset.desc}，${preset.estBeads}），正在生成...`
+        : `Switched to ${preset.label} (${preset.estBeads}), generating...`,
+    );
+  }
+
+  function selectQuickBoard(width: number, height: number) {
+    setSelectedBoardCount(null);
+    setCanvasWidth(width);
+    setCanvasHeight(height);
+    commitHistory();
+    const nextLayers = layers.map((layer) => ({
+      ...layer,
+      cells: placeCellsCentered(layer.cells, project.width, project.height, width, height),
+    }));
+    updateProject({
+      ...project,
+      width,
+      height,
+      layers: nextLayers,
+      cells: composeVisibleCells(nextLayers, width, height),
+    });
+    if (pendingFile) {
+      setConvertWidth(width);
+      autoGenerateShouldCommitRef.current = true;
+    }
+    setNotice(
+      language === 'zh'
+        ? `底板已调整为 ${width} × ${height}${pendingFile ? '，正在自动铺满渲染图案...' : '。'}`
+        : `Board resized to ${width} x ${height}${pendingFile ? ', scaling pattern...' : '.'}`,
+    );
+  }
+
+  function fitPatternToCurrentBoard() {
+    setSelectedBoardCount(null);
+    if (convertWidth === project.width) {
+      setNotice(language === 'zh' ? `当前图案宽度已匹配底板 (${project.width})。` : `Pattern width already matches board (${project.width}).`);
+      return;
+    }
+    setConvertWidth(project.width);
+    if (pendingFile) {
+      autoGenerateShouldCommitRef.current = true;
+    }
+    setNotice(
+      language === 'zh'
+        ? `图案宽度已自动调整为底板宽度 (${project.width}) 并重新渲染。`
+        : `Pattern width adapted to board (${project.width}).`,
+    );
+  }
+
   function applyPreset(value: string) {
     const preset = sizePresets.find((item) => item.label === value);
     if (!preset) return;
-    setCanvasWidth(preset.width);
-    setCanvasHeight(preset.height);
+    selectQuickBoard(preset.width, preset.height);
   }
 
   function handleImageFile(file: File) {
@@ -1023,10 +1214,24 @@ export default function App() {
       setNotice(language === 'zh' ? '请使用 PNG、JPG、JPEG 或 WebP 图片。' : 'Use a PNG, JPG, JPEG, or WebP image.');
       return;
     }
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      if (img.naturalWidth && img.naturalHeight) {
+        const ratio = img.naturalWidth / img.naturalHeight;
+        setImageRatio(ratio);
+        const optimal = getPresetForBoardCount(4, ratio);
+        setSelectedBoardCount(4);
+        setConvertWidth(optimal.targetWidth);
+        setCanvasWidth(optimal.canvasW);
+        setCanvasHeight(optimal.canvasH);
+      }
+    };
+    img.src = url;
     setPendingFile(file);
     setPendingImageUrl((current) => {
       if (current) URL.revokeObjectURL(current);
-      return URL.createObjectURL(file);
+      return url;
     });
     setReferenceFile(file);
     setReferenceImageUrl((current) => {
@@ -1076,21 +1281,24 @@ export default function App() {
         backgroundColor: [255, 255, 255],
         tolerance,
         speckleReduction: defaultImportSettings.speckleReduction,
+        cropFocus,
+        edgeBoost,
+        photoSimplifier,
       });
       if (requestId !== generationRequestRef.current) return;
       if (options.recordHistory) commitHistory();
-      const nextWidth = Math.max(sourceProject.width, result.width);
-      const nextHeight = Math.max(sourceProject.height, result.height);
+      const nextWidth = Math.max(result.width, canvasWidth);
+      const nextHeight = Math.max(result.height, canvasHeight);
       const nextLayers = sourceLayers.map((layer) => {
         if (layer.id === targetLayerId) {
           return {
             ...layer,
-            cells: resizeCells(result.cells, result.width, result.height, nextWidth, nextHeight),
+            cells: placeCellsCentered(result.cells, result.width, result.height, nextWidth, nextHeight),
           };
         }
         return {
           ...layer,
-          cells: resizeCells(layer.cells, sourceProject.width, sourceProject.height, nextWidth, nextHeight),
+          cells: placeCellsCentered(layer.cells, sourceProject.width, sourceProject.height, nextWidth, nextHeight),
         };
       });
       const nextProject = {
@@ -1101,6 +1309,8 @@ export default function App() {
         layers: nextLayers,
         cells: composeVisibleCells(nextLayers, nextWidth, nextHeight),
       };
+      setCanvasWidth(nextWidth);
+      setCanvasHeight(nextHeight);
       updateProject(nextProject);
       setNotice(
         language === 'zh'
@@ -1572,6 +1782,19 @@ export default function App() {
               <span className="project-action-divider" aria-hidden="true" />
               <button className="project-action-button history-action" onClick={undo} disabled={past.length === 0} title={`${text.undo} (Ctrl+Z / ⌘Z)`} aria-keyshortcuts="Control+Z Meta+Z"><UndoIcon /><span>{text.undo}</span></button>
               <button className="project-action-button history-action" onClick={redo} disabled={future.length === 0} title={`${text.redo} (Ctrl+Shift+Z / ⌘⇧Z / Ctrl+Y)`} aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z Control+Y"><RedoIcon /><span>{text.redo}</span></button>
+              <span className="project-action-divider" aria-hidden="true" />
+              <button
+                className={`project-action-button ${project.settings.showGrid ? 'toggle-active' : ''}`}
+                onClick={() =>
+                  updateProject({
+                    ...project,
+                    settings: { ...project.settings, showGrid: !project.settings.showGrid },
+                  })
+                }
+                title={project.settings.showGrid ? text.hideGrid : text.showGrid}
+              >
+                <span>{project.settings.showGrid ? `👁️ ${text.hideGrid}` : `🔲 ${text.showGrid}`}</span>
+              </button>
             </div>
       </div>
 
@@ -1612,6 +1835,78 @@ export default function App() {
             </span>
           </button>
 
+          <button
+            type="button"
+            className="action-btn"
+            style={{ width: '100%', marginTop: '6px', padding: '6px 10px', fontSize: '12px', background: '#e0e7ff', color: '#3730a3', border: '1px solid #c7d2fe', borderRadius: '6px', cursor: 'pointer' }}
+            onClick={() => {
+              fetch('/sample_avatar.jpg')
+                .then((res) => res.blob())
+                .then((blob) => {
+                  const file = new File([blob], '我的专属卡通形象_极客博主.jpg', { type: 'image/jpeg' });
+                  handleImageFile(file);
+                });
+            }}
+          >
+            🧑 快速载入你的卡通博主头像
+          </button>
+
+          {(() => {
+            const p1 = getPresetForBoardCount(1, imageRatio);
+            const p2 = getPresetForBoardCount(2, imageRatio);
+            const p4 = getPresetForBoardCount(4, imageRatio);
+            const p6 = getPresetForBoardCount(6, imageRatio);
+            return (
+              <div className="quick-board-container">
+                <span className="field-label-with-help">
+                  {text.quickBoardsTitle}
+                  <span className="help-dot image-help-dot" {...imageHelpProps(text.tipRealPhoto)}>?</span>
+                </span>
+                <div className="image-quick-boards">
+                  <button
+                    type="button"
+                    className={`quick-board-btn ${selectedBoardCount === 1 || convertWidth === p1.targetWidth ? 'active' : ''}`}
+                    onClick={() => selectBoardByCount(1)}
+                  >
+                    <strong>{p1.label}</strong>
+                    <small>{p1.estBeads}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={`quick-board-btn ${selectedBoardCount === 2 || convertWidth === p2.targetWidth ? 'active' : ''}`}
+                    onClick={() => selectBoardByCount(2)}
+                  >
+                    <strong>{p2.label}</strong>
+                    <small>{p2.estBeads}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={`quick-board-btn full-width ${selectedBoardCount === 4 || convertWidth === p4.targetWidth ? 'active' : ''}`}
+                    onClick={() => selectBoardByCount(4)}
+                  >
+                    <strong>⭐ {p4.label} (推荐实拍)</strong>
+                    <small>{p4.estBeads}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={`quick-board-btn full-width ${selectedBoardCount === 6 || convertWidth === p6.targetWidth ? 'active' : ''}`}
+                    onClick={() => selectBoardByCount(6)}
+                  >
+                    <strong>👑 {p6.label} (超清海报)</strong>
+                    <small>{p6.estBeads}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="quick-board-btn full-width fit-btn"
+                    onClick={fitPatternToCurrentBoard}
+                  >
+                    🔄 {text.fitBoard} ({project.width}×{project.height})
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
           <div className="image-field-grid">
             <label className="image-number-field">
               <span className="field-label-with-help">
@@ -1642,25 +1937,98 @@ export default function App() {
             </label>
           </div>
 
-          <label className="stacked-field image-style-field">
+          <div className="stacked-field image-style-field">
             <span>{text.generationStyle}</span>
-            <select
-              aria-label="Generation style"
-              value={generationStyle}
-              onChange={(event) => setGenerationStyle(event.target.value as GenerationStyle)}
-            >
-              <option value="cartoon">{text.generationStyleCartoon}</option>
-              <option value="realistic">{text.generationStyleRealistic}</option>
-            </select>
-          </label>
+            <div className="style-toggle-group">
+              <button
+                type="button"
+                className={`style-toggle-btn ${generationStyle === 'cartoon' ? 'active' : ''}`}
+                onClick={() => setGenerationStyle('cartoon')}
+              >
+                🧸 {text.generationStyleCartoon}
+              </button>
+              <button
+                type="button"
+                className={`style-toggle-btn ${generationStyle === 'realistic' ? 'active' : ''}`}
+                onClick={() => setGenerationStyle('realistic')}
+              >
+                📸 {text.generationStyleRealistic}
+              </button>
+            </div>
+          </div>
 
           <label className="stacked-field image-background-field">
-            <span>{text.background}</span>
+            <span className="field-label-with-help">
+              {text.background}
+              <span className="help-dot image-help-dot" {...imageHelpProps(text.tipRealPhoto)}>?</span>
+            </span>
             <select aria-label="Background handling" value={backgroundMode} onChange={(event) => setBackgroundMode(event.target.value as BackgroundMode)}>
               <option value="keep">{text.keepBackground}</option>
+              <option value="smart-edge">{text.smartEdge}</option>
               <option value="remove-white">{text.removeWhite}</option>
             </select>
           </label>
+
+          <div className="stacked-field">
+            <span>{text.cropFocusTitle}</span>
+            <div className="style-toggle-group">
+              <button
+                type="button"
+                className={`style-toggle-btn ${cropFocus === 'full' ? 'active' : ''}`}
+                onClick={() => setCropFocus('full')}
+              >
+                {text.cropFocusFull}
+              </button>
+              <button
+                type="button"
+                className={`style-toggle-btn ${cropFocus === 'head' ? 'active' : ''}`}
+                onClick={() => setCropFocus('head')}
+              >
+                {text.cropFocusHead}
+              </button>
+            </div>
+          </div>
+
+          <label className="switch-row edge-boost-row">
+            <span>
+              {text.photoSimplifierLabel}
+              <span className="help-dot image-help-dot" {...imageHelpProps(text.photoSimplifierTip)}>?</span>
+            </span>
+            <input
+              type="checkbox"
+              checked={photoSimplifier}
+              onChange={(e) => setPhotoSimplifier(e.target.checked)}
+            />
+          </label>
+
+          <label className="switch-row edge-boost-row">
+            <span>{text.edgeBoostLabel}</span>
+            <input
+              type="checkbox"
+              checked={edgeBoost}
+              onChange={(e) => setEdgeBoost(e.target.checked)}
+            />
+          </label>
+
+          <button
+            type="button"
+            className="magic-1board-btn"
+            onClick={() => {
+              setCropFocus('head');
+              setPhotoSimplifier(true);
+              setEdgeBoost(true);
+              setGenerationStyle('cartoon');
+              setBackgroundMode('smart-edge');
+              selectBoardByCount(1);
+              setNotice(text.oneClickMagicNotice);
+            }}
+          >
+            {text.oneClickMagic1Board}
+          </button>
+
+          <div className="image-tip-banner">
+            <span>{text.tipRealPhoto}</span>
+          </div>
         </section>
 
         <section className="left-card reference-card">
@@ -3181,6 +3549,30 @@ function resizeCells(
   for (let y = 0; y < copyHeight; y += 1) {
     for (let x = 0; x < copyWidth; x += 1) {
       next[y * newWidth + x] = cells[y * oldWidth + x] ?? null;
+    }
+  }
+  return next;
+}
+
+function placeCellsCentered(
+  cells: Array<string | null>,
+  oldWidth: number,
+  oldHeight: number,
+  newWidth: number,
+  newHeight: number,
+): Array<string | null> {
+  const next = Array.from({ length: newWidth * newHeight }, () => null as string | null);
+  const offsetX = Math.max(0, Math.floor((newWidth - oldWidth) / 2));
+  const offsetY = Math.max(0, Math.floor((newHeight - oldHeight) / 2));
+  const copyWidth = Math.min(oldWidth, newWidth);
+  const copyHeight = Math.min(oldHeight, newHeight);
+  for (let y = 0; y < copyHeight; y += 1) {
+    const targetY = y + offsetY;
+    if (targetY >= newHeight) break;
+    for (let x = 0; x < copyWidth; x += 1) {
+      const targetX = x + offsetX;
+      if (targetX >= newWidth) break;
+      next[targetY * newWidth + targetX] = cells[y * oldWidth + x] ?? null;
     }
   }
   return next;
